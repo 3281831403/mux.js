@@ -50,6 +50,8 @@ var mp2t = require('../lib/m2ts'),
     PMT = utils.PMT,
     PAT = utils.PAT,
     generatePMT = utils.generatePMT,
+    generateMultiProgramPAT = utils.generateMultiProgramPAT,
+    generateProgramPMT = utils.generateProgramPMT,
     pesHeader = utils.pesHeader,
     packetize = utils.packetize,
     videoPes = utils.videoPes,
@@ -311,6 +313,123 @@ QUnit.test('parse the elementary streams from a program map table', function(ass
   assert.strictEqual(transportParseStream.programMapTable.video, 0x11, 'associated h264 with pid 0x11');
   assert.strictEqual(transportParseStream.programMapTable.audio, 0x12, 'associated adts with pid 0x12');
   assert.deepEqual(transportParseStream.programMapTable, packet.programMapTable, 'recorded the PMT');
+});
+
+QUnit.test('parses all programs from a multi-program PAT, skipping NIT', function(assert) {
+  transportParseStream.push(packetize(generateMultiProgramPAT([
+    // NIT, program_number 0
+    {programNumber: 0, pid: 0x10},
+    // audio-only companion program
+    {programNumber: 1, pid: 0x100},
+    // main program with video
+    {programNumber: 2, pid: 0x101}
+  ])));
+
+  assert.deepEqual(
+    transportParseStream.pmtPids,
+    [0x100, 0x101],
+    'collected the pmt pids of all programs and skipped the NIT entry'
+  );
+  assert.strictEqual(transportParseStream.pmtPid, 0x100, 'pmtPid is the first program');
+});
+
+QUnit.test('an audio-only companion PMT does not claim the program map table', function(assert) {
+  var
+    pmts = 0,
+    companionPmt = generateProgramPMT(0x100, 1, [
+      {streamType: ADTS_STREAM_TYPE, pid: 0x301}
+    ]),
+    mainPmt = generateProgramPMT(0x101, 2, [
+      {streamType: H264_STREAM_TYPE, pid: 0x202},
+      {streamType: ADTS_STREAM_TYPE, pid: 0x201}
+    ]);
+
+  transportParseStream.on('data', function(data) {
+    if (data.type === 'pmt') {
+      pmts++;
+    }
+  });
+
+  transportParseStream.push(packetize(generateMultiProgramPAT([
+    {programNumber: 1, pid: 0x100},
+    {programNumber: 2, pid: 0x101}
+  ])));
+
+  // the companion program's PMT arrives first
+  transportParseStream.push(packetize(companionPmt));
+
+  assert.strictEqual(pmts, 0, 'did not emit the companion program PMT');
+  assert.strictEqual(
+    transportParseStream.programMapTable,
+    undefined,
+    'the companion program did not claim the program map table'
+  );
+
+  // the main program's PMT arrives later
+  transportParseStream.push(packetize(mainPmt));
+
+  assert.strictEqual(pmts, 1, 'emitted the main program PMT');
+  assert.strictEqual(
+    transportParseStream.programMapTable.video,
+    0x202,
+    'selected the video of the main program'
+  );
+  assert.strictEqual(
+    transportParseStream.programMapTable.audio,
+    0x201,
+    'selected the audio of the same program as the video'
+  );
+
+  // a later repeat of the companion PMT does not replace the main program
+  transportParseStream.push(packetize(companionPmt));
+
+  assert.strictEqual(
+    transportParseStream.programMapTable.video,
+    0x202,
+    'the main program kept the program map table'
+  );
+  assert.strictEqual(
+    transportParseStream.programMapTable.audio,
+    0x201,
+    'audio still belongs to the main program'
+  );
+});
+
+QUnit.test('falls back to an audio-only program on flush when no program has video', function(assert) {
+  var pesTypes = [];
+
+  transportParseStream.on('data', function(data) {
+    if (data.type === 'pes') {
+      pesTypes.push(data.streamType);
+    }
+  });
+
+  transportParseStream.push(packetize(generateMultiProgramPAT([
+    {programNumber: 1, pid: 0x100},
+    {programNumber: 2, pid: 0x101}
+  ])));
+
+  // only the audio-only companion program's PMT ever arrives
+  transportParseStream.push(packetize(generateProgramPMT(0x100, 1, [
+    {streamType: ADTS_STREAM_TYPE, pid: 0x301}
+  ])));
+  transportParseStream.push(packetize(audioPes([0x19, 0x47], true, 0, 0x301)));
+
+  assert.strictEqual(
+    transportParseStream.programMapTable,
+    undefined,
+    'no program selected while waiting for a program with video'
+  );
+
+  transportParseStream.flush();
+
+  assert.ok(transportParseStream.programMapTable, 'fell back to the companion program on flush');
+  assert.strictEqual(
+    transportParseStream.programMapTable.audio,
+    0x301,
+    'mapped the companion program audio'
+  );
+  assert.deepEqual(pesTypes, [ADTS_STREAM_TYPE], 'processed the buffered PES packet');
 });
 
 QUnit.module('MP2T ElementaryStream', {
@@ -3425,6 +3544,131 @@ QUnit.test('no options creates combined output', function(assert) {
   assert.equal('mdat', boxes[1].type, 'generated a first mdat box');
   assert.equal('moof', boxes[2].type, 'generated a second moof box');
   assert.equal('mdat', boxes[3].type, 'generated a second mdat box');
+});
+
+QUnit.test('selects the program with video from a multi-program PAT', function(assert) {
+  var
+    segments = [],
+    trackinfoEvents = [],
+    boxes,
+    trafs = {},
+    transmuxer = new Transmuxer();
+
+  transmuxer.on('data', function(segment) {
+    segments.push(segment);
+  });
+  transmuxer.on('trackinfo', function(trackinfo) {
+    trackinfoEvents.push(trackinfo);
+  });
+
+  // a PAT declaring a NIT entry, an audio-only companion program and
+  // the main program carrying video
+  transmuxer.push(packetize(generateMultiProgramPAT([
+    // NIT, program_number 0
+    {programNumber: 0, pid: 0x10},
+    // audio-only companion program
+    {programNumber: 1, pid: 0x100},
+    // main program
+    {programNumber: 2, pid: 0x101}
+  ])));
+
+  // the companion program's PMT arrives before the main program's and
+  // must not claim the program map table
+  transmuxer.push(packetize(generateProgramPMT(0x100, 1, [
+    {streamType: ADTS_STREAM_TYPE, pid: 0x301}
+  ])));
+  // audio of the companion program must be ignored
+  transmuxer.push(packetize(audioPes([0x19, 0x47], true, 90000, 0x301)));
+
+  // the main program: video on pid 0x202 (514), audio on pid 0x201 (513)
+  transmuxer.push(packetize(generateProgramPMT(0x101, 2, [
+    {streamType: H264_STREAM_TYPE, pid: 0x202},
+    {streamType: ADTS_STREAM_TYPE, pid: 0x201}
+  ])));
+
+  // two audio frames on the main program's audio pid
+  transmuxer.push(packetize(audioPes([0x19, 0x47], true, 90000, 0x201)));
+  transmuxer.push(packetize(audioPes([0x29, 0x48], true, 92322, 0x201)));
+
+  // four video frames on the main program's video pid
+  transmuxer.push(packetize(videoPes([
+      0x09, 0x01 // access_unit_delimiter_rbsp
+  ], true, 90000, 0x202)));
+  transmuxer.push(packetize(videoPes([
+      0x08, 0x01 // pic_parameter_set_rbsp
+  ], true, 90000, 0x202)));
+  transmuxer.push(packetize(videoPes([
+    0x07, // seq_parameter_set_rbsp
+    0x27, 0x42, 0xe0, 0x0b,
+    0xa9, 0x18, 0x60, 0x9d,
+    0x80, 0x53, 0x06, 0x01,
+    0x06, 0xb6, 0xc2, 0xb5,
+    0xef, 0x7c, 0x04
+  ], false, 90000, 0x202)));
+  transmuxer.push(packetize(videoPes([
+      0x05, 0x01 // slice_layer_without_partitioning_rbsp_idr
+  ], true, 90000, 0x202)));
+  transmuxer.push(packetize(videoPes([
+      0x09, 0x01, // access_unit_delimiter_rbsp
+      0x00, 0x00, 0x01, // nal unit start code
+      0x01, 0x9a // slice_layer_without_partitioning_rbsp (non-IDR)
+  ], true, 93000, 0x202)));
+  transmuxer.push(packetize(videoPes([
+      0x09, 0x01,
+      0x00, 0x00, 0x01,
+      0x01, 0x9a
+  ], true, 96000, 0x202)));
+  transmuxer.push(packetize(videoPes([
+      0x09, 0x01,
+      0x00, 0x00, 0x01,
+      0x01, 0x9a
+  ], true, 99000, 0x202)));
+  transmuxer.flush();
+
+  assert.equal(segments.length, 1, 'generated a combined video and audio segment');
+  assert.equal(segments[0].type, 'combined', 'combined is the segment type');
+
+  assert.ok(trackinfoEvents.length, 'trackinfo events fired');
+  assert.ok(
+    trackinfoEvents[trackinfoEvents.length - 1].hasAudio,
+    'trackinfo reports audio'
+  );
+  assert.ok(
+    trackinfoEvents[trackinfoEvents.length - 1].hasVideo,
+    'trackinfo reports video'
+  );
+
+  // collect the trafs of all moofs by track id
+  boxes = mp4.tools.inspect(segments[0].data);
+  boxes.forEach(function(box) {
+    if (box.type !== 'moof') {
+      return;
+    }
+    box.boxes.forEach(function(moofBox) {
+      if (moofBox.type !== 'traf') {
+        return;
+      }
+      var traf = {};
+
+      moofBox.boxes.forEach(function(trafBox) {
+        if (trafBox.type === 'tfhd') {
+          traf.trackId = trafBox.trackId;
+        } else if (trafBox.type === 'tfdt') {
+          traf.baseMediaDecodeTime = trafBox.baseMediaDecodeTime;
+        } else if (trafBox.type === 'trun') {
+          traf.samples = trafBox.samples.length;
+        }
+      });
+      trafs[traf.trackId] = traf;
+    });
+  });
+
+  assert.ok(trafs[514], 'generated a traf for the video track id 514');
+  assert.ok(trafs[513], 'generated a traf for the audio track id 513');
+  assert.equal(trafs[514].samples, 4, 'video traf has four samples');
+  assert.equal(trafs[513].samples, 2, 'audio traf has two samples');
+  assert.equal(trafs[514].baseMediaDecodeTime, 0, 'video tfdt is 0');
+  assert.equal(trafs[513].baseMediaDecodeTime, 0, 'audio tfdt is 0');
 });
 
 QUnit.test('first sequence number option is used in mfhd box', function(assert) {

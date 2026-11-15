@@ -5,6 +5,7 @@ var segments = require('data-files!segments');
 var
   QUnit = require('qunit'),
   probe = require('../lib/m2ts/probe.js'),
+  utils = require('./utils'),
   testSegment = segments['test-segment.ts'](),
   stuffedPesPacket = segments['test-stuffed-pes.ts']();
 
@@ -38,6 +39,37 @@ QUnit.test('correctly parses packet type', function(assert) {
 
 QUnit.test('correctly parses pmt pid from pat packet', function(assert) {
   assert.equal(probe.parsePat(patPacket), pmtPid, 'parses pmt pid from pat');
+});
+
+QUnit.test('correctly parses all program entries from pat packets', function(assert) {
+  assert.deepEqual(probe.parsePatPrograms(patPacket), [{
+    programNumber: 1,
+    pid: pmtPid
+  }], 'parses the single program of a single-program pat');
+
+  var multiProgramPat = utils.packetize(utils.generateMultiProgramPAT([
+    // NIT, program_number 0
+    {programNumber: 0, pid: 0x10},
+    // audio-only companion program
+    {programNumber: 1, pid: 0x100},
+    // main program with video
+    {programNumber: 2, pid: 0x101}
+  ]));
+
+  assert.deepEqual(probe.parsePatPrograms(multiProgramPat), [
+    {programNumber: 0, pid: 0x10},
+    {programNumber: 1, pid: 0x100},
+    {programNumber: 2, pid: 0x101}
+  ], 'parses every program entry of a multi-program pat');
+});
+
+QUnit.test('correctly parses packet type with a list of pmt pids', function(assert) {
+  assert.equal(probe.parseType(pmtPacket, []), null,
+    'cannot determine type of pmt packet with an empty pmt pid list');
+  assert.equal(probe.parseType(pmtPacket, [0x10, pmtPid]), 'pmt',
+    'parses pmt type when the pmt pid is in the list');
+  assert.equal(probe.parseType(pesPacket, [0x10, pmtPid]), 'pes',
+    'parses pes type when the pmt pid is in the list');
 });
 
 QUnit.test('correctly parses program map table from pmt packet', function(assert) {

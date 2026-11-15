@@ -5,6 +5,8 @@ var
   PMT,
   PAT,
   generatePMT,
+  generateMultiProgramPAT,
+  generateProgramPMT,
   pesHeader,
   packetize,
   transportPacket,
@@ -144,6 +146,95 @@ generatePMT = function(options) {
     return PMT.concat([0x00, 0x00, 0x00, 0x00]);
 };
 
+/**
+ * Helper function to create a PAT packet declaring multiple programs
+ * @param programs {array} - array of {programNumber, pid} entries. For
+ *        programNumber 0 the pid is the network PID (NIT), otherwise it
+ *        is the PMT pid of the program.
+ */
+generateMultiProgramPAT = function(programs) {
+  var pat = [
+    0x47, // sync byte
+    // tei:0 pusi:1 tp:0 pid:0 0000 0000 0000
+    0x40, 0x00,
+    // tsc:01 afc:01 cc:0000 pointer_field:0000 0000
+    0x50, 0x00,
+    // tid:0000 0000 ssi:1 0:0 r:00 sl:0000 0000 0000 (set below)
+    0x00, 0xb0, 0x00,
+    // tsi:0000 0000 0000 0001
+    0x00, 0x01,
+    // r:00 vn:00 000 cni:1 sn:0000 0000 lsn:0000 0000
+    0xc1, 0x00, 0x00
+  ];
+
+  programs.forEach(function(program) {
+    // pn:16
+    pat.push((program.programNumber & 0xff00) >> 8, program.programNumber & 0xff);
+    // r:000 pmp/np:13
+    pat.push(0xe0 | ((program.pid & 0x1f00) >> 8), program.pid & 0xff);
+  });
+
+  // section_length covers tsi..lsn (5 bytes), the program entries and
+  // the crc32 (4 bytes)
+  var sectionLength = 5 + programs.length * 4 + 4;
+
+  pat[6] = 0xb0 | ((sectionLength & 0xf00) >> 8);
+  pat[7] = sectionLength & 0xff;
+
+  // crc32 (not verified by the parser)
+  return pat.concat([0x00, 0x00, 0x00, 0x00]);
+};
+
+/**
+ * Helper function to create a PMT packet for a single program
+ * @param pmtPid {number} - the pid the PMT is delivered on
+ * @param programNumber {number} - the program_number of the program
+ * @param streams {array} - array of {streamType, pid} elementary streams
+ */
+generateProgramPMT = function(pmtPid, programNumber, streams) {
+  var pmt = [
+    0x47, // sync byte
+    // tei:0 pusi:1 tp:0 pid:13
+    0x40 | ((pmtPid & 0x1f00) >> 8), pmtPid & 0xff,
+    // tsc:01 afc:01 cc:0000 pointer_field:0000 0000
+    0x50, 0x00,
+    // tid:0000 0010 ssi:1 0:0 r:00 sl:0000 0000 0000 (set below)
+    0x02, 0xb0, 0x00,
+    // pn:16
+    (programNumber & 0xff00) >> 8, programNumber & 0xff,
+    // r:00 vn:00 000 cni:1 sn:0000 0000 lsn:0000 0000
+    0xc1, 0x00, 0x00,
+    // r:000 ppid:13 (set below)
+    0xe0, 0x00,
+    // r:0000 pil:0000 0000 0000
+    0xf0, 0x00
+  ];
+
+  streams.forEach(function(stream) {
+    // st:8 r:000 epid:13 r:0000 esil:0000 0000 0000
+    pmt.push(
+      stream.streamType,
+      0xe0 | ((stream.pid & 0x1f00) >> 8), stream.pid & 0xff,
+      0xf0, 0x00);
+  });
+
+  // section_length covers pn..pil (9 bytes), the stream entries and
+  // the crc32 (4 bytes)
+  var sectionLength = 9 + streams.length * 5 + 4;
+
+  pmt[6] = 0xb0 | ((sectionLength & 0xf00) >> 8);
+  pmt[7] = sectionLength & 0xff;
+
+  // pcr pid: use the first stream's pid
+  if (streams.length) {
+    pmt[13] = 0xe0 | ((streams[0].pid & 0x1f00) >> 8);
+    pmt[14] = streams[0].pid & 0xff;
+  }
+
+  // crc32 (not verified by the parser)
+  return pmt.concat([0x00, 0x00, 0x00, 0x00]);
+};
+
 pesHeader = function(first, pts, dataLength) {
   if (!dataLength) {
     dataLength = 0;
@@ -217,8 +308,10 @@ transportPacket = function(pid, data, first, pts, isVideoData) {
     result = [
       // sync byte
       0x47,
-      // tei:0 pusi:1 tp:0 pid:0 0000 0001 0001
-      0x40, pid,
+      // tei:0 pusi:1 tp:0 pid:5 (high bits of the 13-bit pid)
+      0x40 | ((pid & 0x1f00) >> 8),
+      // pid:8 (low bits of the 13-bit pid)
+      pid & 0xff,
       // tsc:01 afc:11 cc:0000
       0x70
     ].concat([
@@ -246,9 +339,11 @@ transportPacket = function(pid, data, first, pts, isVideoData) {
  * @param data {arraylike} - the payload bytes
  * @payload first {boolean} - true if this PES should be a payload
  * unit start
+ * @param pts {number} - optional presentation timestamp
+ * @param pid {number} - optional pid, defaults to 0x11
  */
-videoPes = function(data, first, pts) {
-  return transportPacket(0x11, [
+videoPes = function(data, first, pts, pid) {
+  return transportPacket(typeof pid === 'number' ? pid : 0x11, [
     // NAL unit start code
     0x00, 0x00, 0x01
   ].concat(data), first, pts, true);
@@ -275,9 +370,11 @@ adtsFrame = function(dataLength) {
  * @param data {arraylike} - the payload bytes
  * @payload first {boolean} - true if this PES should be a payload
  * unit start
+ * @param pts {number} - optional presentation timestamp
+ * @param pid {number} - optional pid, defaults to 0x12
  */
-audioPes = function(data, first, pts) {
-  return transportPacket(0x12,
+audioPes = function(data, first, pts, pid) {
+  return transportPacket(typeof pid === 'number' ? pid : 0x12,
     adtsFrame(data.length).concat(data),
     first, pts);
 };
@@ -315,6 +412,8 @@ module.exports = {
   PMT: PMT,
   PAT: PAT,
   generatePMT: generatePMT,
+  generateMultiProgramPAT: generateMultiProgramPAT,
+  generateProgramPMT: generateProgramPMT,
   pesHeader: pesHeader,
   packetize: packetize,
   transportPacket: transportPacket,

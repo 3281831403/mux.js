@@ -13,6 +13,9 @@ var
   parseAudioPes_ = tsInspector.parseAudioPes_,
   packetize = utils.packetize,
   audioPes = utils.audioPes,
+  videoPes = utils.videoPes,
+  generateMultiProgramPAT = utils.generateMultiProgramPAT,
+  generateProgramPMT = utils.generateProgramPMT,
   PES_TIMESCALE = 90000;
 
 QUnit.module('TS Inspector');
@@ -139,8 +142,91 @@ QUnit.test('can parse an aac segment', function(assert) {
   assert.deepEqual(inspect(aacSegment), expected, 'parses aac segment timing data');
 });
 
-QUnit.test('can parse ts segment with no audio muxed in', function(assert) {
-  var expected = {
+QUnit.test('can parse a ts segment whose PAT declares multiple programs', function(assert) {
+  var
+    packets = [
+      // a NIT entry, an audio-only companion program and the main
+      // program carrying video
+      generateMultiProgramPAT([
+        {programNumber: 0, pid: 0x10},
+        {programNumber: 1, pid: 0x100},
+        {programNumber: 2, pid: 0x101}
+      ]),
+      // the companion program's PMT arrives first
+      generateProgramPMT(0x100, 1, [
+        {streamType: StreamTypes.ADTS_STREAM_TYPE, pid: 0x301}
+      ]),
+      audioPes([0x19, 0x47], true, 126000, 0x301),
+      // the main program: video on 0x202, audio on 0x201
+      generateProgramPMT(0x101, 2, [
+        {streamType: StreamTypes.H264_STREAM_TYPE, pid: 0x202},
+        {streamType: StreamTypes.ADTS_STREAM_TYPE, pid: 0x201}
+      ]),
+      videoPes([0x09, 0x01], true, 126000, 0x202),
+      videoPes([0x05, 0x01], true, 126000, 0x202),
+      audioPes([0x19, 0x47], true, 126000, 0x201),
+      videoPes([
+        0x09, 0x01,
+        0x00, 0x00, 0x01,
+        0x01, 0x9a
+      ], true, 924000, 0x202),
+      audioPes([0x29, 0x48], true, 859518, 0x201)
+    ],
+    segment = new Uint8Array(packets.length * 188),
+    expected = {
+      video: [
+        {
+          type: 'video',
+          pts: 126000,
+          dts: 126000,
+          ptsTime: 126000 / PES_TIMESCALE,
+          dtsTime: 126000 / PES_TIMESCALE
+        },
+        {
+          type: 'video',
+          pts: 924000,
+          dts: 924000,
+          ptsTime: 924000 / PES_TIMESCALE,
+          dtsTime: 924000 / PES_TIMESCALE
+        }
+      ],
+      firstKeyFrame: {
+        type: 'video',
+        pts: 126000,
+        dts: 126000,
+        ptsTime: 126000 / PES_TIMESCALE,
+        dtsTime: 126000 / PES_TIMESCALE
+      },
+      audio: [
+        {
+          type: 'audio',
+          pts: 126000,
+          dts: 126000,
+          ptsTime: 126000 / PES_TIMESCALE,
+          dtsTime: 126000 / PES_TIMESCALE
+        },
+        {
+          type: 'audio',
+          pts: 859518,
+          dts: 859518,
+          ptsTime: 859518 / PES_TIMESCALE,
+          dtsTime: 859518 / PES_TIMESCALE
+        }
+      ]
+    };
+
+  packets.forEach(function(packet, i) {
+    segment.set(packetize(packet), i * 188);
+  });
+
+  assert.deepEqual(
+    inspect(segment),
+    expected,
+    'reports audio and video of the main program and ignores the companion program'
+  );
+});
+
+QUnit.test('can parse ts segment with no audio muxed in', function(assert) {  var expected = {
     video: [
       {
         type: 'video',
